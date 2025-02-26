@@ -1,0 +1,270 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Create a Python Lambda function subscribed to EventBridge events indicating DNS changes in an RDS SQL Server instance.
+  The Lambda executes an SSM document on a Windows EC2 instance using PowerShell.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: "VPC ID to deploy the Lambda function."
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: "Subnet IDs list to deploy the Lambda function."
+
+  VPCEndpointSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: "Security group ID that allow access to the VPC endpoints"
+
+  RDSInstanceId:
+    Type: String
+    Description: "ID of the RDS SQL Server instance"
+
+  RDSEndpoint:
+    Type: String
+    Description: "Endpoint of the RDS SQL Server instance"
+
+  RDSPort:
+    Type: String
+    Description: "Port of the RDS SQL Server instance"
+    Default: 1433
+
+  RDSSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: "SecurityGroup Id of the RDS SQL Server instance"
+
+  EC2InstanceId:
+    Type: AWS::EC2::Instance::Id
+    Description: "ID of the Windows EC2 instance to run the SSM document"
+
+  ActiveDirectoryDomain:
+    Type: String
+    Description: "The Active Directory Domain used for SQL Server authentication"
+
+  SecretArn:
+    Type: String
+    Description: "The ARN of the secret in Secrets Manager containing SQL Server connection parameters"
+
+  KMSKeyId:
+    Type: String
+    Description: "The KMS Key ID used to decrypt the secret"
+    Default: "aws/secretsmanager"
+
+Resources:
+  MSSQLKerberosCallbackExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+        - PolicyName: "LambdaSSMPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${EC2InstanceId}"
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/${SetSPNForRDSSSMDocument}"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetCommandInvocation
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:*"
+        - PolicyName: "LambdaSecretsManagerPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SecretArn
+        - PolicyName: "LambdaKMSDecryptPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/${KMSKeyId}"
+
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2SSMRole
+
+  MSSQLKerberosCallbackLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "main.lambda_handler"
+      Role: !GetAtt MSSQLKerberosCallbackExecutionRole.Arn
+      Architectures:
+        - arm64
+      Code: src/rds-dns-change/
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 300
+      ReservedConcurrentExecutions: 5
+
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref MSSQLKerberosCallbackSecurityGroup
+          - !Ref VPCEndpointSecurityGroupId
+
+      Environment:
+        Variables:
+          EC2_INSTANCE_ID: !Ref EC2InstanceId
+          RDS_ENDPOINT: !Ref RDSEndpoint
+          RDS_PORT: !Ref RDSPort
+          SECRET_ARN: !Ref SecretArn
+          SSM_DOCUMENT: !Ref SetSPNForRDSSSMDocument
+          AD_DOMAIN: !Ref ActiveDirectoryDomain
+
+  MSSQLKerberosCallbackSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: "Allows outbound traffic to RDS SQL Server on the specified port"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: !Ref RDSPort
+          ToPort: !Ref RDSPort
+          DestinationSecurityGroupId: !Ref RDSSecurityGroupId
+          Description: "Allows outbound traffic to RDS SQL Server on the specified port."
+
+  MSSQLKerberosCallbackSecurityGroupIngress:
+   Type: AWS::EC2::SecurityGroupIngress
+   Properties:
+      GroupId: !Ref RDSSecurityGroupId
+      Description: !Sub "Allow traffic from MSSQLKerberosCallbackLambda to ${RDSPort} port"
+      IpProtocol: tcp
+      FromPort: !Ref RDSPort
+      ToPort: !Ref RDSPort
+      SourceSecurityGroupId: !GetAtt MSSQLKerberosCallbackSecurityGroup.GroupId
+
+  RDSChangeEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to capture RDS MSSQL Server changes"
+      EventPattern:
+        source:
+          - "aws.rds"
+        detail-type:
+          - "RDS DB Instance Event"
+        detail:
+          EventID:
+            - "RDS-EVENT-0005"  # DB instance created
+            - "RDS-EVENT-0006"  # DB instance restarted
+            - "RDS-EVENT-0025"  # Finished applying modification to convert to a Multi-AZ DB instance
+            - "RDS-EVENT-0029"  # Finished applying modification to convert to a standard (Single-AZ) DB instance
+            - "RDS-EVENT-0049"  # Multi-AZ instance failover completed
+            - "RDS-EVENT-0051"  # Multi-AZ instance activation completed
+            - "RDS-EVENT-0065"  # Recovered from partial failover
+            - "RDS-EVENT-0088"  # DB instance started
+            - "RDS-EVENT-0154"  # DB instance is being started due to it exceeding the maximum allowed time being stopped
+          SourceArn:
+            - !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:db:${RDSInstanceId}"
+      Targets:
+        - Arn: !GetAtt MSSQLKerberosCallbackLambda.Arn
+          Id: "MSSQLKerberosCallbackLambdaTarget"
+
+  MSSQLKerberosCallbackInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MSSQLKerberosCallbackLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt RDSChangeEventRule.Arn
+
+  SetSPNForRDSSSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: "Command"
+      Content:
+        schemaVersion: "2.2"
+        description: "Runs a PowerShell script on the Windows EC2 instance to set SPNs for RDS SQL Server endpoints"
+        parameters:
+          RDSEndpoint:
+            type: "String"
+            description: "RDS Endpoint"
+          RDSPort:
+            type: "String"
+            description: "RDS Port"
+          ServerNames:
+            type: "String"
+            description: "Comma-separated list of server names"
+        mainSteps:
+          - action: "aws:runPowerShellScript"
+            name: "RunPowerShellScript"
+            inputs:
+              timeoutSeconds: 3600
+              runCommand:
+                - "$ServerNames = '{{ServerNames}}'"
+                - "$RDSEndpoint = '{{RDSEndpoint}}'"
+                - "$RDSPort = '{{RDSPort}}'"
+
+                - "$ServerList = $ServerNames -split ','"
+                - "$SPN = 'MSSQLSvc/' + $RDSEndpoint + ':' + $RDSPort"
+                - "$SPN_Listener = 'MSSQLSvc/listener.' + $RDSEndpoint + ':' + $RDSPort"
+
+                - "$Matches = ''"
+                - "$spnOutput = & setspn -Q $SPN"
+                - "$cnLine = $spnOutput | Select-String -Pattern 'CN='"
+                - "if ($cnLine -match 'CN=([^,]*)') {"
+                - "  $CN = $Matches[1]"
+                - "  Write-Host \"CN found: $CN for $SPN\""
+                - "  setspn -D $SPN $CN"
+                - "}"
+
+                - "$Matches = ''"
+                - "$spnOutput = & setspn -Q $SPN_Listener"
+                - "$cnLine = $spnOutput | Select-String -Pattern 'CN='"
+                - "if ($cnLine -match 'CN=([^,]*)') {"
+                - "  $CN = $Matches[1]"
+                - "  Write-Host \"CN found: $CN for $SPN_Listener\""
+                - "  setspn -D $SPN_Listener $CN"
+                - "}"
+
+                - "foreach ($Server in $ServerList) {"
+                - "  Write-Host \"Executing setspn for ${Server}\""
+                - "  setspn -S $SPN $Server"
+                - "  setspn -S $SPN_Listener $Server"
+                - "}"
+
+Outputs:
+  LambdaFunctionName:
+    Value: !Ref MSSQLKerberosCallbackLambda
+
+  SSMDocumentName:
+    Value: !Ref SetSPNForRDSSSMDocument
